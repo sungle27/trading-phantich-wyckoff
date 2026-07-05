@@ -398,6 +398,24 @@ async def main():
         print(f"[init] Regime summary: {regime_counts}")
     print(f"[init] Historical data loaded. Starting WebSocket...")
 
+    # Thông báo bot đã start
+    regime_counts = {}
+    for st in states.values():
+        regime_counts[st.regime] = regime_counts.get(st.regime, 0) + 1
+
+    try:
+        await asyncio.wait_for(send_telegram(
+            f"✅ BOT RUNNING [Wyckoff v1]\n"
+            f"Symbols: {len(states)} | Mode: {'PAPER' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'LIVE'}\n"
+            f"Regime: {regime_counts}\n"
+            f"Balance: 1000$ | NAV: 100$/lệnh\n"
+            f"Debug: {'ON' if int(getattr(CFG, 'DEBUG_ENABLED', 0)) else 'OFF'} | "
+            f"Paper: {'ON' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'OFF (LIVE)'}\n"
+            f"Execution: {getattr(CFG, 'EXECUTION_URL', 'N/A')}"
+        ), timeout=10)
+    except Exception:
+        pass
+
     _book_base  = "wss://stream.binance.com:9443/stream"
     book_chunks = [syms[i:i+50] for i in range(0, len(syms), 50)]
     url_books   = [
