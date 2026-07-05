@@ -18,7 +18,7 @@ from app.execution_client import ExecutionClient
 from app.simulator import SimulationEngine
 
 # Global simulator
-SIM = SimulationEngine()
+sim = SimulationEngine()
 
 
 # ============================================================
@@ -157,7 +157,7 @@ async def _try_open_position(sym: str, st: SymbolState) -> None:
 
     if int(getattr(CFG, "PAPER_TRADE", 1)):
         # Paper trade — simulate
-        SIM.open_position(sig, entry, sl, tp, sl_pct, tp_pct)
+        sim.open_position(sig, entry, sl, tp, sl_pct, tp_pct)
     else:
         # Live trade — gửi sang execution service
         exec_client.emit({
@@ -216,7 +216,7 @@ async def summary_loop(states: Dict[str, SymbolState]) -> None:
                     f"Candles 1h: {len(btc.candles_1h)} | 4h: {len(btc.candles_4h)}\n"
                     f"Range: {btc.range_low:.2f} - {btc.range_high:.2f}\n"
                     f"Signals OK: {_signal_ok_count}\n"
-                    f"{SIM.summary()}"
+                    f"{sim.summary()}"
                 ), timeout=10)
             except Exception:
                 pass
@@ -335,7 +335,7 @@ async def ws_aggtrade_binance(states: Dict[str, SymbolState]) -> None:
 
                                     # Update simulator positions
                                     if int(getattr(CFG, "PAPER_TRADE", 1)):
-                                        await SIM.update(sym, c1.high, c1.low, c1.close)
+                                        await sim.update(sym, c1.high, c1.low, c1.close)
 
                                     # Check signal mỗi nến 1h
                                     await _try_open_position(sym, st)
