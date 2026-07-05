@@ -1,4 +1,4 @@
-app = 'trading-phantich-backup'
+app = 'trading-phantich-wyckoff'
 primary_region = "nrt"
 
 [build]
