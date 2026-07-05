@@ -1,112 +1,137 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Dict
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from app.config import CFG
+from app.telegram import send_telegram
+
+NAV        = 100.0    # USDT mỗi lệnh
+BALANCE    = 1000.0   # Tổng tài sản
 
 
 @dataclass
-class SimPosition:
-    symbol: str
-    direction: str
-    qty: float
-    entry: float
-    sl: float
-    tp: float
-    risk_usd: float
+class Position:
+    symbol:     str
+    direction:  str   # LONG / SHORT
+    entry:      float
+    sl:         float
+    tp:         float
+    sl_pct:     float
+    tp_pct:     float
+    signal_type: str
+    regime:     str
+    open_time:  float = field(default_factory=time.time)
 
-
-class ExecutionSimulator:
-    def __init__(self, nav_usd: float, rr: float = 2.0):
-        self.nav = float(nav_usd)
-        self.base_rr = float(rr)
-        self.positions: Dict[str, SimPosition] = {}
-
-        # ==== STAT TRACKING ====
-        self.total_trades = 0
-        self.win_trades = 0
-        self.loss_trades = 0
-        self.total_pnl = 0.0
-
-    def has_pos(self, symbol: str) -> bool:
-        return symbol in self.positions
-
-    def open(self, pos: SimPosition) -> None:
-        self.positions[pos.symbol] = pos
-
-    def close(self, symbol: str) -> Optional[SimPosition]:
-        if symbol in self.positions:
-            return self.positions.pop(symbol)
-        return None
-
-    def update_by_candle(self, symbol: str, candle: dict) -> Optional[dict]:
-        pos = self.positions.get(symbol)
-        if not pos:
-            return None
-
-        high = float(candle["high"])
-        low = float(candle["low"])
-
-        result = None
-        exit_price = None
-        pnl = 0.0
-
-        # LONG
-        if pos.direction == "LONG":
-            if low <= pos.sl:
-                pnl = -pos.risk_usd
-                exit_price = pos.sl
-                result = "SL"
-            elif high >= pos.tp:
-                pnl = pos.risk_usd * self.base_rr
-                exit_price = pos.tp
-                result = "TP"
-
-        # SHORT
+    def pnl(self, close_price: float) -> float:
+        if self.direction == "LONG":
+            return NAV * (close_price - self.entry) / self.entry
         else:
-            if high >= pos.sl:
-                pnl = -pos.risk_usd
-                exit_price = pos.sl
-                result = "SL"
-            elif low <= pos.tp:
-                pnl = pos.risk_usd * self.base_rr
-                exit_price = pos.tp
-                result = "TP"
+            return NAV * (self.entry - close_price) / self.entry
+
+    def is_sl_hit(self, high: float, low: float) -> bool:
+        if self.direction == "LONG":
+            return low <= self.sl
+        else:
+            return high >= self.sl
+
+    def is_tp_hit(self, high: float, low: float) -> bool:
+        if self.direction == "LONG":
+            return high >= self.tp
+        else:
+            return low <= self.tp
+
+
+class SimulationEngine:
+    def __init__(self):
+        self.positions:   Dict[str, Position] = {}  # sym → Position
+        self.closed:      List[dict] = []
+        self.total_pnl:   float = 0.0
+        self.wins:        int   = 0
+        self.losses:      int   = 0
+
+    def open_position(self, sig: dict, entry: float, sl: float, tp: float,
+                      sl_pct: float, tp_pct: float) -> bool:
+        sym = sig["symbol"]
+        if sym in self.positions:
+            return False  # đã có vị thế
+
+        self.positions[sym] = Position(
+            symbol      = sym,
+            direction   = sig["direction"],
+            entry       = entry,
+            sl          = sl,
+            tp          = tp,
+            sl_pct      = sl_pct,
+            tp_pct      = tp_pct,
+            signal_type = sig.get("signal_type", ""),
+            regime      = sig.get("market_regime", ""),
+        )
+        return True
+
+    async def update(self, sym: str, high: float, low: float, close: float) -> None:
+        if sym not in self.positions:
+            return
+
+        pos = self.positions[sym]
+        result = None
+        close_price = None
+
+        if pos.is_tp_hit(high, low):
+            result      = "WIN"
+            close_price = pos.tp
+        elif pos.is_sl_hit(high, low):
+            result      = "LOSS"
+            close_price = pos.sl
 
         if result:
-            self.nav += pnl
-            self.total_trades += 1
+            pnl      = pos.pnl(close_price)
+            duration = (time.time() - pos.open_time) / 3600
+
             self.total_pnl += pnl
-
-            if pnl > 0:
-                self.win_trades += 1
+            if result == "WIN":
+                self.wins += 1
             else:
-                self.loss_trades += 1
+                self.losses += 1
 
-            self.close(symbol)
+            total = self.wins + self.losses
+            winrate = self.wins / total * 100 if total > 0 else 0
 
-            return {
-                "result": result,
-                "exit": exit_price,
-                "pnl": pnl,
-            }
+            self.closed.append({
+                "symbol":    sym,
+                "direction": pos.direction,
+                "signal":    pos.signal_type,
+                "regime":    pos.regime,
+                "entry":     pos.entry,
+                "close":     close_price,
+                "pnl":       pnl,
+                "result":    result,
+                "duration":  duration,
+            })
 
-        return None
+            del self.positions[sym]
 
-    # ===============================
-    # Performance summary
-    # ===============================
-    def summary(self) -> dict:
-        winrate = (
-            (self.win_trades / self.total_trades) * 100
-            if self.total_trades > 0
-            else 0.0
+            balance = BALANCE + self.total_pnl
+            emoji = "✅" if result == "WIN" else "❌"
+            await send_telegram(
+                f"{emoji} {result} [{pos.signal_type}] {pos.direction} {sym}\n"
+                f"Entry: {pos.entry:.6f} → Close: {close_price:.6f}\n"
+                f"PnL: {'+' if pnl > 0 else ''}{pnl:.2f} USDT\n"
+                f"Duration: {duration:.1f}h | Regime: {pos.regime}\n"
+                f"W/L: {self.wins}/{self.losses} | WR: {winrate:.1f}%\n"
+                f"Balance: {balance:.2f}$ | PnL: {self.total_pnl:+.2f}$"
+            )
+
+    def summary(self) -> str:
+        total    = self.wins + self.losses
+        winrate  = self.wins / total * 100 if total > 0 else 0
+        open_pos = len(self.positions)
+        balance  = BALANCE + self.total_pnl
+        return (
+            f"📊 SIM SUMMARY\n"
+            f"Balance: {balance:.2f}$ / {BALANCE:.0f}$\n"
+            f"Open: {open_pos} | Closed: {total}\n"
+            f"W/L: {self.wins}/{self.losses} | WR: {winrate:.1f}%\n"
+            f"Total PnL: {self.total_pnl:+.2f} USDT"
         )
-
-        return {
-            "total": self.total_trades,
-            "wins": self.win_trades,
-            "losses": self.loss_trades,
-            "winrate": winrate,
-            "pnl": self.total_pnl,
-            "nav": self.nav,
-        }

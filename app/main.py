@@ -15,6 +15,10 @@ from app.symbols import FALLBACK_SYMBOLS
 from app.utils import backoff_s
 from app.market_regime import MarketRegimeEngine
 from app.execution_client import ExecutionClient
+from app.simulator import SimulationEngine
+
+# Global simulator
+SIM = SimulationEngine()
 
 
 # ============================================================
@@ -151,22 +155,27 @@ async def _try_open_position(sym: str, st: SymbolState) -> None:
 
     rr = round(tp_pct / sl_pct, 2)
 
-    exec_client.emit({
-        "schema":          "trade_signal.v1",
-        "idempotency_key": f"{sym}_{int(time.time() * 1000)}",
-        "symbol":          sym,
-        "direction":       direction,
-        "entry":           entry,
-        "sl":              sl,
-        "tp":              tp,
-        "qty":             0.0,
-        "risk_usd":        0.0,
-        "rr":              rr,
-        "mode":            "main",
-        "regime":          st.regime,
-        "ts":              int(time.time()),
-        "ttl_sec":         20,
-    })
+    if int(getattr(CFG, "PAPER_TRADE", 1)):
+        # Paper trade — simulate
+        SIM.open_position(sig, entry, sl, tp, sl_pct, tp_pct)
+    else:
+        # Live trade — gửi sang execution service
+        exec_client.emit({
+            "schema":          "trade_signal.v1",
+            "idempotency_key": f"{sym}_{int(time.time() * 1000)}",
+            "symbol":          sym,
+            "direction":       direction,
+            "entry":           entry,
+            "sl":              sl,
+            "tp":              tp,
+            "qty":             0.0,
+            "risk_usd":        0.0,
+            "rr":              rr,
+            "mode":            "main",
+            "regime":          st.regime,
+            "ts":              int(time.time()),
+            "ttl_sec":         20,
+        })
 
     await send_telegram(
         f"🟢 {signal_type} {direction} {sym}\n"
@@ -206,7 +215,8 @@ async def summary_loop(states: Dict[str, SymbolState]) -> None:
                     f"Price: {btc_mid:.2f} | Regime: {btc.regime}\n"
                     f"Candles 1h: {len(btc.candles_1h)} | 4h: {len(btc.candles_4h)}\n"
                     f"Range: {btc.range_low:.2f} - {btc.range_high:.2f}\n"
-                    f"Signals OK: {_signal_ok_count}"
+                    f"Signals OK: {_signal_ok_count}\n"
+                    f"{SIM.summary()}"
                 ), timeout=10)
             except Exception:
                 pass
@@ -322,6 +332,10 @@ async def ws_aggtrade_binance(states: Dict[str, SymbolState]) -> None:
                                             f"Range: {st.range_low:.6f} - {st.range_high:.6f}\n"
                                             f"{rr.reason}"
                                         ))
+
+                                    # Update simulator positions
+                                    if int(getattr(CFG, "PAPER_TRADE", 1)):
+                                        await SIM.update(sym, c1.high, c1.low, c1.close)
 
                                     # Check signal mỗi nến 1h
                                     await _try_open_position(sym, st)
