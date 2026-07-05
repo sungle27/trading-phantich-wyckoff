@@ -410,7 +410,7 @@ async def main():
             f"✅ BOT RUNNING [Wyckoff v1]\n"
             f"Symbols: {len(states)} | Mode: {'PAPER' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'LIVE'}\n"
             f"Regime: {regime_counts}\n"
-            f"Balance: 1000$ | NAV: 100$/lệnh\n"
+            f"Balance: 10000$ | NAV: 1000$/lệnh\n"
             f"Debug: {'ON' if int(getattr(CFG, 'DEBUG_ENABLED', 0)) else 'OFF'} | "
             f"Paper: {'ON' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'OFF (LIVE)'}\n"
             f"Execution: {getattr(CFG, 'EXECUTION_URL', 'N/A')}"

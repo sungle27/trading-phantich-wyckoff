@@ -7,8 +7,8 @@ from typing import Dict, List, Optional
 from app.config import CFG
 from app.telegram import send_telegram
 
-NAV        = 100.0    # USDT mỗi lệnh
-BALANCE    = 1000.0   # Tổng tài sản
+NAV        = 1000.0   # USDT mỗi lệnh
+BALANCE    = 10000.0  # Tổng tài sản
 
 
 @dataclass
