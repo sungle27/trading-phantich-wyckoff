@@ -100,11 +100,11 @@ class MarketRegimeEngine:
             return _make_result()
 
         # Trong range — phân biệt Accumulation vs Distribution
-        if prior_trend_pct > 0.02:
+        if prior_trend_pct > 0.01:
             # Uptrend trước range + volume tăng → DISTRIBUTION
             self.regime = "DISTRIBUTION"
             self.last_reason = f"distribution: prior={prior_trend_pct:.3f} vol_trend={vol_trend:.3f}"
-        elif prior_trend_pct < -0.02:
+        elif prior_trend_pct < -0.01:
             # Downtrend trước range → ACCUMULATION
             self.regime = "ACCUMULATION"
             self.last_reason = f"accumulation: prior={prior_trend_pct:.3f}"
