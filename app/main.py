@@ -256,6 +256,7 @@ async def ws_aggtrade_binance(states: Dict[str, SymbolState]) -> None:
     chunks     = [syms[i:i+chunk_size] for i in range(0, len(syms), chunk_size)]
 
     try:
+        print("[init] Sending BOT RUNNING to Telegram...")
         await asyncio.wait_for(send_telegram(
             f"✅ BOT RUNNING [Wyckoff v1]\n"
             f"symbols={len(syms)} | 1h signal | 4h range\n"
@@ -404,6 +405,7 @@ async def main():
         regime_counts[st.regime] = regime_counts.get(st.regime, 0) + 1
 
     try:
+        print("[init] Sending BOT RUNNING to Telegram...")
         await asyncio.wait_for(send_telegram(
             f"✅ BOT RUNNING [Wyckoff v1]\n"
             f"Symbols: {len(states)} | Mode: {'PAPER' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'LIVE'}\n"
@@ -413,8 +415,8 @@ async def main():
             f"Paper: {'ON' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'OFF (LIVE)'}\n"
             f"Execution: {getattr(CFG, 'EXECUTION_URL', 'N/A')}"
         ), timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[init] Telegram error: {e}")
 
     _book_base  = "wss://stream.binance.com:9443/stream"
     book_chunks = [syms[i:i+50] for i in range(0, len(syms), 50)]
