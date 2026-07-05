@@ -1,0 +1,16 @@
+app = 'trading-phantich-backup'
+primary_region = "nrt"
+
+[build]
+
+[processes]
+app = "python -m app.main"
+
+[deploy]
+  strategy = "rolling"
+  min_machines_running = 2
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "1gb"
