@@ -17,16 +17,13 @@ from app.market_regime import MarketRegimeEngine
 from app.execution_client import ExecutionClient
 from app.simulator import SimulationEngine
 
-# Global simulator
-sim = SimulationEngine()
-
-
 # ============================================================
 # Globals
 # ============================================================
 _block_counts: dict = {}
 _signal_check_count = 0
 _signal_ok_count    = 0
+sim = SimulationEngine()
 
 exec_client = ExecutionClient(
     base_url=str(getattr(CFG, "EXECUTION_URL", "")),
@@ -41,24 +38,20 @@ REST_BASE = "https://fapi.binance.com"
 # FETCH HISTORICAL CANDLES
 # ============================================================
 async def fetch_klines(sess: aiohttp.ClientSession, symbol: str, interval: str, limit: int) -> List[dict]:
-    """Fetch lịch sử candles từ Binance REST API."""
-    url = f"{REST_BASE}/fapi/v1/klines"
+    url    = f"{REST_BASE}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
         async with sess.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 return []
             data = await resp.json()
-            candles = []
-            for k in data:
-                candles.append({
-                    "open":   float(k[1]),
-                    "high":   float(k[2]),
-                    "low":    float(k[3]),
-                    "close":  float(k[4]),
-                    "volume": float(k[5]),
-                })
-            return candles
+            return [{
+                "open":   float(k[1]),
+                "high":   float(k[2]),
+                "low":    float(k[3]),
+                "close":  float(k[4]),
+                "volume": float(k[5]),
+            } for k in data]
     except Exception:
         return []
 
@@ -72,16 +65,13 @@ class SymbolState:
         self.ask         = None
         self.cur_sec     = None
         self.vol_bucket  = 0.0
-        self.r1h         = TimeframeResampler(60 * 60)       # 1h candles
-        self.r4h         = TimeframeResampler(4 * 60 * 60)   # 4h Trading Range
-        self.candles_1h: List[dict]  = []
-        self.volumes_1h: List[float] = []
-        self.candles_4h: List[dict]  = []
-        self.regime:     str         = "UNKNOWN"
-        self.panic:      bool        = False
-        self.range_high: float       = 0.0
-        self.range_low:  float       = 0.0
-        self.mre        = MarketRegimeEngine()
+        self.r15m        = TimeframeResampler(15 * 60)    # M15 signal
+        self.r1h         = TimeframeResampler(60 * 60)    # H1 trend
+        self.candles_15m: List[dict]  = []
+        self.volumes_15m: List[float] = []
+        self.candles_1h:  List[dict]  = []
+        self.regime:      str         = "UNKNOWN"
+        self.mre         = MarketRegimeEngine()
 
     def mid(self) -> Optional[float]:
         if self.bid is None or self.ask is None:
@@ -101,65 +91,47 @@ class SymbolState:
 async def _try_open_position(sym: str, st: SymbolState) -> None:
     global _signal_check_count, _signal_ok_count
 
-    # Warmup check
-    warmup = int(getattr(CFG, "WARMUP_CANDLES", 6))
-    if len(st.candles_4h) < warmup:
-        return
-
     sig = check_signal(
         sym,
-        st.candles_1h,
-        st.volumes_1h,
+        st.candles_15m,
+        st.volumes_15m,
         st.spread(),
         mode="main",
         market_regime=st.regime,
-        market_panic=st.panic,
-        range_high=st.range_high,
-        range_low=st.range_low,
+        market_panic=False,
+        candles_1h=st.candles_1h,
     )
     _signal_check_count += 1
-    if int(getattr(CFG, "DEBUG_ENABLED", 0)):
-        print(f"[check] {sym} regime={market_regime} 1h={len(st.candles_1h)} 4h={len(st.candles_4h)} range={st.range_low:.4f}-{st.range_high:.4f}")
     if not sig:
         return
     _signal_ok_count += 1
-    if int(getattr(CFG, "DEBUG_ENABLED", 0)):
-        print(f"[signal] {sym} {sig['signal_type']} {sig['direction']} vol_ratio={sig.get('vol_ratio',0):.2f}")
 
     direction    = str(sig["direction"]).upper()
     signal_type  = sig.get("signal_type", "")
-    entry        = st.mid() or st.candles_1h[-1]["close"] if st.candles_1h else 0
+    entry        = st.mid() or st.candles_15m[-1]["close"]
 
-    _regime    = st.regime.upper()
-    signal_type = sig.get("signal_type", "")
-
-    if signal_type == "UPTHRUST":        # SHORT setup
-        sl_pct = float(getattr(CFG, "SL_PCT_UPTHRUST", 0.015))   # 1.5%
-        tp_pct = float(getattr(CFG, "TP_PCT_UPTHRUST", 0.030))   # 3.0%
-    elif signal_type == "SPRING":        # LONG setup
-        sl_pct = float(getattr(CFG, "SL_PCT_SPRING", 0.015))     # 1.5%
-        tp_pct = float(getattr(CFG, "TP_PCT_SPRING", 0.030))     # 3.0%
-    elif _regime == "MARKDOWN":          # SHORT trong markdown
-        sl_pct = float(getattr(CFG, "SL_PCT_MARKDOWN", 0.020))   # 2.0%
-        tp_pct = float(getattr(CFG, "TP_PCT_MARKDOWN", 0.040))   # 4.0%
-    else:
-        sl_pct = float(getattr(CFG, "SL_PCT", 0.015))
-        tp_pct = float(getattr(CFG, "TP_PCT", 0.030))
+    # SL dưới/trên đáy retest
+    retest_level = sig.get("retest_level", entry)
+    sl_buffer    = float(getattr(CFG, "SL_BUFFER", 0.002))  # 0.2% buffer
 
     if direction == "LONG":
-        sl = entry * (1 - sl_pct)
-        tp = entry * (1 + tp_pct)
+        sl = retest_level * (1 - sl_buffer)
+        sl_pct = (entry - sl) / entry
+        tp_rr  = float(getattr(CFG, "TP_RR", 2.0))
+        tp = entry + (entry - sl) * tp_rr
+        tp_pct = (tp - entry) / entry
     else:
-        sl = entry * (1 + sl_pct)
-        tp = entry * (1 - tp_pct)
+        sl = retest_level * (1 + sl_buffer)
+        sl_pct = (sl - entry) / entry
+        tp_rr  = float(getattr(CFG, "TP_RR", 2.0))
+        tp = entry - (sl - entry) * tp_rr
+        tp_pct = (entry - tp) / entry
 
-    rr = round(tp_pct / sl_pct, 2)
+    rr = round(tp_rr, 2)
 
     if int(getattr(CFG, "PAPER_TRADE", 1)):
-        # Paper trade — simulate
         sim.open_position(sig, entry, sl, tp, sl_pct, tp_pct)
     else:
-        # Live trade — gửi sang execution service
         exec_client.emit({
             "schema":          "trade_signal.v1",
             "idempotency_key": f"{sym}_{int(time.time() * 1000)}",
@@ -181,9 +153,9 @@ async def _try_open_position(sym: str, st: SymbolState) -> None:
         f"🟢 {signal_type} {direction} {sym}\n"
         f"Entry: {entry:.6f}\n"
         f"SL: {sl:.6f} | TP: {tp:.6f}\n"
-        f"RR: {rr} | Regime: {st.regime}\n"
-        f"Range: {st.range_low:.6f} - {st.range_high:.6f}\n"
-        f"Vol ratio: {sig.get('vol_ratio', 0):.2f}x"
+        f"RR: {rr} | RSI: {sig.get('rsi', 0):.1f}\n"
+        f"Vol: {sig.get('vol_ratio', 0):.2f}x | Regime: {st.regime}\n"
+        f"Struct: {sig.get('struct_low', 0):.6f} - {sig.get('struct_high', 0):.6f}"
     )
 
 
@@ -200,21 +172,20 @@ async def summary_loop(states: Dict[str, SymbolState]) -> None:
         if int(getattr(CFG, "DEBUG_ENABLED", 0)):
             print(
                 f"[summary] btc_regime={btc.regime if btc else 'N/A'} "
-                f"btc_1h={len(btc.candles_1h) if btc else 0} "
-                f"btc_4h={len(btc.candles_4h) if btc else 0} "
+                f"15m={len(btc.candles_15m) if btc else 0} "
+                f"1h={len(btc.candles_1h) if btc else 0} "
                 f"blocks={dict(_block_counts)}"
             )
         _block_counts.clear()
 
-        if tick % 12 == 0 and btc and btc.candles_1h:
-            last_c  = btc.candles_1h[-1]
+        if tick % 12 == 0 and btc and btc.candles_15m:
+            last_c  = btc.candles_15m[-1]
             btc_mid = btc.mid() or last_c["close"]
             try:
                 await asyncio.wait_for(send_telegram(
                     f"📊 BTC HOURLY\n"
                     f"Price: {btc_mid:.2f} | Regime: {btc.regime}\n"
-                    f"Candles 1h: {len(btc.candles_1h)} | 4h: {len(btc.candles_4h)}\n"
-                    f"Range: {btc.range_low:.2f} - {btc.range_high:.2f}\n"
+                    f"Candles 15m: {len(btc.candles_15m)} | 1h: {len(btc.candles_1h)}\n"
                     f"Signals OK: {_signal_ok_count}\n"
                     f"{sim.summary()}"
                 ), timeout=10)
@@ -256,15 +227,16 @@ async def ws_aggtrade_binance(states: Dict[str, SymbolState]) -> None:
     chunks     = [syms[i:i+chunk_size] for i in range(0, len(syms), chunk_size)]
 
     try:
-        print("[init] Sending BOT RUNNING to Telegram...")
         await asyncio.wait_for(send_telegram(
-            f"✅ BOT RUNNING [Wyckoff v1]\n"
-            f"symbols={len(syms)} | 1h signal | 4h range\n"
-            f"Focus: UPTHRUST SHORT\n"
-            f"Execution: {getattr(CFG,'EXECUTION_URL','N/A')}"
+            f"✅ BOT RUNNING [Fake Breakout Filter v1]\n"
+            f"Symbols: {len(states)} | M15 signal | H1 trend\n"
+            f"Mode: {'PAPER' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'LIVE'} | "
+            f"Debug: {'ON' if int(getattr(CFG, 'DEBUG_ENABLED', 0)) else 'OFF'}\n"
+            f"Balance: 10000$ | NAV: 1000$/lệnh\n"
+            f"Session filter: {'ON' if int(getattr(CFG, 'SESSION_FILTER', 1)) else 'OFF'}"
         ), timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[init] Telegram error: {e}")
 
     async def handle_chunk(chunk: list, idx: int, sess: aiohttp.ClientSession) -> None:
         url = ws_base + "?streams=" + "/".join(f"{s.lower()}@aggTrade" for s in chunk)
@@ -293,52 +265,42 @@ async def ws_aggtrade_binance(states: Dict[str, SymbolState]) -> None:
                         while sec > st.cur_sec:
                             mid = st.mid() or price
                             if mid:
-                                # ── 4h candle (Trading Range) ──
-                                c4, d4 = st.r4h.update(st.cur_sec, mid, qty)
-                                if d4 and c4:
-                                    st.candles_4h.append({
-                                        "open": c4.open, "high": c4.high,
-                                        "low": c4.low, "close": c4.close,
-                                        "volume": c4.volume
-                                    })
-                                    st.candles_4h = st.candles_4h[-200:]
-
-                                # ── 1h candle (Signal) ──
-                                c1, d1 = st.r1h.update(st.cur_sec, mid, qty)
+                                # ── H1 candle (trend) ──
+                                c1, d1 = st.r1h.update(st.cur_sec, mid, 0.0)
                                 if d1 and c1:
                                     st.candles_1h.append({
                                         "open": c1.open, "high": c1.high,
-                                        "low": c1.low, "close": c1.close,
-                                        "volume": c1.volume
+                                        "low": c1.low, "close": c1.close
                                     })
-                                    st.volumes_1h.append(c1.volume)
                                     st.candles_1h = st.candles_1h[-300:]
-                                    st.volumes_1h = st.volumes_1h[-300:]
 
-                                    # Update regime mỗi nến 1h
+                                    # Update regime mỗi nến H1
+                                    rr = st.mre.update(st.candles_1h)
                                     prev_regime = st.regime
-                                    rr = st.mre.update(st.candles_1h, st.candles_4h)
-                                    st.regime     = rr.regime
-                                    st.panic      = rr.panic
-                                    st.range_high = rr.range_high
-                                    st.range_low  = rr.range_low
+                                    st.regime   = rr.regime
 
-                                    if int(getattr(CFG, "DEBUG_ENABLED", 0)):
-                                        print(f"[regime] {sym} {prev_regime}->{st.regime} range={st.range_low:.4f}-{st.range_high:.4f} reason={rr.reason}")
-
-                                    # Notify regime change
                                     if st.regime != prev_regime and int(getattr(CFG, "REGIME_NOTIFY", 1)):
                                         asyncio.get_event_loop().create_task(send_telegram(
-                                            f"🌐 REGIME {sym}: {prev_regime} → {st.regime}\n"
-                                            f"Range: {st.range_low:.6f} - {st.range_high:.6f}\n"
-                                            f"{rr.reason}"
+                                            f"🌐 REGIME {sym}: {prev_regime} → {st.regime}\n{rr.reason}"
                                         ))
 
-                                    # Update simulator positions
-                                    if int(getattr(CFG, "PAPER_TRADE", 1)):
-                                        await sim.update(sym, c1.high, c1.low, c1.close)
+                                # ── M15 candle (signal) ──
+                                c15, d15 = st.r15m.update(st.cur_sec, mid, qty)
+                                if d15 and c15:
+                                    st.candles_15m.append({
+                                        "open": c15.open, "high": c15.high,
+                                        "low": c15.low, "close": c15.close,
+                                        "volume": c15.volume
+                                    })
+                                    st.volumes_15m.append(c15.volume)
+                                    st.candles_15m = st.candles_15m[-400:]
+                                    st.volumes_15m = st.volumes_15m[-400:]
 
-                                    # Check signal mỗi nến 1h
+                                    # Update simulator
+                                    if int(getattr(CFG, "PAPER_TRADE", 1)):
+                                        await sim.update(sym, c15.high, c15.low, c15.close)
+
+                                    # Check signal
                                     await _try_open_position(sym, st)
 
                             st.vol_bucket = 0.0
@@ -362,58 +324,38 @@ async def main():
     states = {s: SymbolState() for s in FALLBACK_SYMBOLS}
     syms   = list(states.keys())
 
-    # ── Fetch lịch sử candles khi start ──
+    # ── Fetch historical candles ──
     print(f"[init] Fetching historical candles for {len(syms)} symbols...")
     async with aiohttp.ClientSession() as sess:
-        tasks_4h = [fetch_klines(sess, s, "4h", 80) for s in syms]
-        tasks_1h = [fetch_klines(sess, s, "1h", 80) for s in syms]
+        tasks_1h  = [fetch_klines(sess, s, "1h",  250) for s in syms]  # 250 nến H1 cho EMA200
+        tasks_15m = [fetch_klines(sess, s, "15m",  80) for s in syms]
 
-        results_4h = await asyncio.gather(*tasks_4h, return_exceptions=True)
-        results_1h = await asyncio.gather(*tasks_1h, return_exceptions=True)
+        results_1h  = await asyncio.gather(*tasks_1h,  return_exceptions=True)
+        results_15m = await asyncio.gather(*tasks_15m, return_exceptions=True)
 
+        regime_counts = {}
         for i, sym in enumerate(syms):
-            if isinstance(results_4h[i], list) and results_4h[i]:
-                states[sym].candles_4h = results_4h[i]
             if isinstance(results_1h[i], list) and results_1h[i]:
                 states[sym].candles_1h = results_1h[i]
-                states[sym].volumes_1h = [c["volume"] for c in results_1h[i]]
+                rr = states[sym].mre.update(states[sym].candles_1h)
+                states[sym].regime = rr.regime
+            if isinstance(results_15m[i], list) and results_15m[i]:
+                states[sym].candles_15m = results_15m[i]
+                states[sym].volumes_15m = [c["volume"] for c in results_15m[i]]
 
-            # Init regime từ historical data
-            if states[sym].candles_4h and states[sym].candles_1h:
-                rr = states[sym].mre.update(states[sym].candles_1h, states[sym].candles_4h)
-                states[sym].regime     = rr.regime
-                states[sym].panic      = rr.panic
-                states[sym].range_high = rr.range_high
-                states[sym].range_low  = rr.range_low
+            regime_counts[states[sym].regime] = regime_counts.get(states[sym].regime, 0) + 1
 
-    # Debug: log kết quả fetch
-    if int(getattr(CFG, "DEBUG_ENABLED", 0)):
-        for sym in list(states.keys()):  # log tất cả symbols
-            st = states[sym]
-            if st.regime != "UNKNOWN":  # chỉ in regime khác UNKNOWN
-                print(f"[init] {sym} 4h={len(st.candles_4h)} 1h={len(st.candles_1h)} regime={st.regime} range={st.range_low:.4f}-{st.range_high:.4f}")
-        # Tổng kết
-        regime_counts = {}
-        for st in states.values():
-            regime_counts[st.regime] = regime_counts.get(st.regime, 0) + 1
-        print(f"[init] Regime summary: {regime_counts}")
-    print(f"[init] Historical data loaded. Starting WebSocket...")
-
-    # Thông báo bot đã start
-    regime_counts = {}
-    for st in states.values():
-        regime_counts[st.regime] = regime_counts.get(st.regime, 0) + 1
+    print(f"[init] Regime: {regime_counts}")
+    print(f"[init] Done. Starting WebSocket...")
 
     try:
-        print("[init] Sending BOT RUNNING to Telegram...")
         await asyncio.wait_for(send_telegram(
-            f"✅ BOT RUNNING [Wyckoff v1]\n"
-            f"Symbols: {len(states)} | Mode: {'PAPER' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'LIVE'}\n"
-            f"Regime: {regime_counts}\n"
+            f"✅ BOT RUNNING [Fake Breakout Filter v1]\n"
+            f"Symbols: {len(states)} | M15 signal | H1 trend\n"
+            f"Mode: {'PAPER' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'LIVE'} | "
+            f"Debug: {'ON' if int(getattr(CFG, 'DEBUG_ENABLED', 0)) else 'OFF'}\n"
             f"Balance: 10000$ | NAV: 1000$/lệnh\n"
-            f"Debug: {'ON' if int(getattr(CFG, 'DEBUG_ENABLED', 0)) else 'OFF'} | "
-            f"Paper: {'ON' if int(getattr(CFG, 'PAPER_TRADE', 1)) else 'OFF (LIVE)'}\n"
-            f"Execution: {getattr(CFG, 'EXECUTION_URL', 'N/A')}"
+            f"Regime: {regime_counts}"
         ), timeout=10)
     except Exception as e:
         print(f"[init] Telegram error: {e}")
