@@ -350,6 +350,7 @@ async def main():
     print(f"[init] Fetching historical candles for {len(syms)} symbols...")
     async with aiohttp.ClientSession() as sess:
         tasks_1h  = [fetch_klines(sess, s, "1h",  250) for s in syms]  # 250 nến H1 cho EMA200
+        tasks_2h  = [fetch_klines(sess, s, "2h",   20) for s in syms]  # 20 nến 2h cho regime
         tasks_15m = [fetch_klines(sess, s, "15m",  80) for s in syms]
 
         results_1h  = await asyncio.gather(*tasks_1h,  return_exceptions=True)
