@@ -5,7 +5,7 @@ from typing import List, Optional
 
 from app.config import CFG
 
-REGIMES = ("UPTREND", "DOWNTREND", "UNKNOWN")
+REGIMES = ("TREND_UP", "TREND_DOWN", "NORMAL", "UNKNOWN")
 
 
 def _get(name: str, default):
@@ -19,52 +19,76 @@ class RegimeResult:
     reason: str
 
 
-def _ema(closes: List[float], period: int) -> Optional[float]:
-    if len(closes) < period:
-        return None
-    mult = 2.0 / (period + 1.0)
-    val  = closes[0]
-    for p in closes[1:]:
-        val = (p - val) * mult + val
-    return val
-
-
 class MarketRegimeEngine:
     """
-    Xu hướng H1 dùng EMA50 vs EMA200:
-    - EMA50 > EMA200 → UPTREND  → chỉ BUY
-    - EMA50 < EMA200 → DOWNTREND → chỉ SELL
+    Regime dựa trên 4 nến 2h liên tiếp:
+    - 4 nến tăng liên tục + ratio > 0.6 + price_change > 1.2% + volume spike → TREND_UP
+    - 4 nến giảm liên tục + ratio < 0.4 + price_change < -1.2% + volume spike → TREND_DOWN
+    - Còn lại → NORMAL
     """
 
     def __init__(self):
-        self.regime = "UNKNOWN"
-        self.panic  = False
+        self.regime      = "UNKNOWN"
+        self.panic       = False
         self.last_reason = "init"
 
-    def update(self, candles_1h: List[dict]) -> RegimeResult:
-        EMA_FAST = int(_get("TREND_EMA_FAST", 50))
-        EMA_SLOW = int(_get("TREND_EMA_SLOW", 200))
+    def update(self, candles_2h: List[dict]) -> RegimeResult:
+        PERIOD         = int(_get("REGIME_CANDLE_PERIOD", 4))
+        PRICE_THRESH   = float(_get("REGIME_PRICE_THRESHOLD", 0.012))  # 1.2%
+        RATIO_UP       = float(_get("REGIME_RATIO_UP", 0.6))
+        RATIO_DOWN     = float(_get("REGIME_RATIO_DOWN", 0.4))
+        VOL_SPIKE      = float(_get("REGIME_VOL_SPIKE", 1.3))          # 1.3x
 
-        if len(candles_1h) < EMA_SLOW:
+        # Chưa đủ dữ liệu
+        if len(candles_2h) < PERIOD * 2:
             self.regime = "UNKNOWN"
-            self.last_reason = f"insufficient data {len(candles_1h)}/{EMA_SLOW}"
+            self.last_reason = f"insufficient data {len(candles_2h)}/{PERIOD*2}"
             return RegimeResult(self.regime, False, self.last_reason)
 
-        closes = [c["close"] for c in candles_1h]
-        ema_fast = _ema(closes, EMA_FAST)
-        ema_slow = _ema(closes, EMA_SLOW)
+        cur  = candles_2h[-PERIOD:]    # 4 nến hiện tại
+        prev = candles_2h[-PERIOD*2:-PERIOD]  # 4 nến trước
 
-        if ema_fast is None or ema_slow is None:
-            self.regime = "UNKNOWN"
-            self.last_reason = "ema calc failed"
-            return RegimeResult(self.regime, False, self.last_reason)
+        # ── Consecutive closes ──
+        closes = [c["close"] for c in cur]
+        up_consecutive   = all(closes[i] > closes[i-1] for i in range(1, PERIOD))
+        down_consecutive = all(closes[i] < closes[i-1] for i in range(1, PERIOD))
 
-        if ema_fast > ema_slow:
-            self.regime = "UPTREND"
-            self.last_reason = f"ema{EMA_FAST}={ema_fast:.4f} > ema{EMA_SLOW}={ema_slow:.4f}"
+        # ── Body position ratio ──
+        ratios = []
+        for c in cur:
+            rng = c["high"] - c["low"]
+            if rng > 0:
+                ratios.append((c["close"] - c["low"]) / rng)
+        ratio_avg = sum(ratios) / len(ratios) if ratios else 0.5
+
+        # ── Price change ──
+        price_change = (closes[-1] - closes[0]) / closes[0] if closes[0] > 0 else 0
+
+        # ── Volume spike ──
+        vol_cur  = sum(c.get("volume", 0) for c in cur)  / PERIOD
+        vol_prev = sum(c.get("volume", 0) for c in prev) / PERIOD
+        vol_ratio = vol_cur / vol_prev if vol_prev > 0 else 1
+
+        # ── TREND_UP ──
+        if (up_consecutive and
+                ratio_avg > RATIO_UP and
+                price_change > PRICE_THRESH and
+                vol_ratio >= VOL_SPIKE):
+            self.regime = "TREND_UP"
+            self.last_reason = f"trend_up: change={price_change:.3f} ratio={ratio_avg:.2f} vol={vol_ratio:.2f}"
+
+        # ── TREND_DOWN ──
+        elif (down_consecutive and
+                ratio_avg < RATIO_DOWN and
+                price_change < -PRICE_THRESH and
+                vol_ratio >= VOL_SPIKE):
+            self.regime = "TREND_DOWN"
+            self.last_reason = f"trend_down: change={price_change:.3f} ratio={ratio_avg:.2f} vol={vol_ratio:.2f}"
+
+        # ── NORMAL ──
         else:
-            self.regime = "DOWNTREND"
-            self.last_reason = f"ema{EMA_FAST}={ema_fast:.4f} < ema{EMA_SLOW}={ema_slow:.4f}"
+            self.regime = "NORMAL"
+            self.last_reason = f"normal: change={price_change:.3f} ratio={ratio_avg:.2f} vol={vol_ratio:.2f}"
 
         self.panic = False
         return RegimeResult(self.regime, False, self.last_reason)

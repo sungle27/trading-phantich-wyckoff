@@ -66,10 +66,12 @@ class SymbolState:
         self.cur_sec     = None
         self.vol_bucket  = 0.0
         self.r15m        = TimeframeResampler(15 * 60)    # M15 signal
-        self.r1h         = TimeframeResampler(60 * 60)    # H1 trend
+        self.r1h         = TimeframeResampler(60 * 60)    # H1 trend (EMA50/200)
+        self.r2h         = TimeframeResampler(2 * 60 * 60)  # 2h regime
         self.candles_15m: List[dict]  = []
         self.volumes_15m: List[float] = []
         self.candles_1h:  List[dict]  = []
+        self.candles_2h:  List[dict]  = []
         self.regime:      str         = "UNKNOWN"
         self.mre         = MarketRegimeEngine()
 
@@ -110,22 +112,32 @@ async def _try_open_position(sym: str, st: SymbolState) -> None:
     signal_type  = sig.get("signal_type", "")
     entry        = st.mid() or st.candles_15m[-1]["close"]
 
-    # SL dưới/trên đáy retest
-    retest_level = sig.get("retest_level", entry)
-    sl_buffer    = float(getattr(CFG, "SL_BUFFER", 0.002))  # 0.2% buffer
-
-    if direction == "LONG":
-        sl = retest_level * (1 - sl_buffer)
-        sl_pct = (entry - sl) / entry
-        tp_rr  = float(getattr(CFG, "TP_RR", 2.0))
-        tp = entry + (entry - sl) * tp_rr
-        tp_pct = (tp - entry) / entry
+    # SL/TP
+    if int(getattr(CFG, "USE_FIXED_SLTP", 1)):
+        # % cố định
+        sl_pct = float(getattr(CFG, "SL_PCT", 0.005))  # 0.5%
+        tp_pct = float(getattr(CFG, "TP_PCT", 0.010))  # 1.0%
+        if direction == "LONG":
+            sl = entry * (1 - sl_pct)
+            tp = entry * (1 + tp_pct)
+        else:
+            sl = entry * (1 + sl_pct)
+            tp = entry * (1 - tp_pct)
     else:
-        sl = retest_level * (1 + sl_buffer)
-        sl_pct = (sl - entry) / entry
-        tp_rr  = float(getattr(CFG, "TP_RR", 2.0))
-        tp = entry - (sl - entry) * tp_rr
-        tp_pct = (entry - tp) / entry
+        # ATR-based
+        retest_level = sig.get("retest_level", entry)
+        atr          = sig.get("atr", entry * 0.005)
+        tp_rr        = float(getattr(CFG, "TP_RR", 2.0))
+        if direction == "LONG":
+            sl     = retest_level - atr
+            sl_pct = (entry - sl) / entry
+            tp     = entry + (entry - sl) * tp_rr
+            tp_pct = (tp - entry) / entry
+        else:
+            sl     = retest_level + atr
+            sl_pct = (sl - entry) / entry
+            tp     = entry - (sl - entry) * tp_rr
+            tp_pct = (entry - tp) / entry
 
     rr = round(tp_rr, 2)
 
@@ -265,7 +277,7 @@ async def ws_aggtrade_binance(states: Dict[str, SymbolState]) -> None:
                         while sec > st.cur_sec:
                             mid = st.mid() or price
                             if mid:
-                                # ── H1 candle (trend) ──
+                                # ── H1 candle (EMA50/200 trend) ──
                                 c1, d1 = st.r1h.update(st.cur_sec, mid, 0.0)
                                 if d1 and c1:
                                     st.candles_1h.append({
@@ -274,8 +286,18 @@ async def ws_aggtrade_binance(states: Dict[str, SymbolState]) -> None:
                                     })
                                     st.candles_1h = st.candles_1h[-300:]
 
-                                    # Update regime mỗi nến H1
-                                    rr = st.mre.update(st.candles_1h)
+                                # ── 2h candle (regime) ──
+                                c2, d2 = st.r2h.update(st.cur_sec, mid, qty)
+                                if d2 and c2:
+                                    st.candles_2h.append({
+                                        "open": c2.open, "high": c2.high,
+                                        "low": c2.low, "close": c2.close,
+                                        "volume": c2.volume
+                                    })
+                                    st.candles_2h = st.candles_2h[-200:]
+
+                                    # Update regime mỗi nến 2h
+                                    rr = st.mre.update(st.candles_2h)
                                     prev_regime = st.regime
                                     st.regime   = rr.regime
 
@@ -331,13 +353,16 @@ async def main():
         tasks_15m = [fetch_klines(sess, s, "15m",  80) for s in syms]
 
         results_1h  = await asyncio.gather(*tasks_1h,  return_exceptions=True)
+        results_2h  = await asyncio.gather(*tasks_2h,  return_exceptions=True)
         results_15m = await asyncio.gather(*tasks_15m, return_exceptions=True)
 
         regime_counts = {}
         for i, sym in enumerate(syms):
             if isinstance(results_1h[i], list) and results_1h[i]:
                 states[sym].candles_1h = results_1h[i]
-                rr = states[sym].mre.update(states[sym].candles_1h)
+            if isinstance(results_2h[i], list) and results_2h[i]:
+                states[sym].candles_2h = results_2h[i]
+                rr = states[sym].mre.update(states[sym].candles_2h)
                 states[sym].regime = rr.regime
             if isinstance(results_15m[i], list) and results_15m[i]:
                 states[sym].candles_15m = results_15m[i]
